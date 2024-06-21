@@ -1,11 +1,15 @@
-# fix path
 import sys
-sys.path.insert(0, 'llmchat')
+from pathlib import Path
 
-from config import Config
-from client import DiscordClient
+# Fix path
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'llmchat2'))
 
-if __name__ == "__main__":
+from llmchat.config import Config
+from llmchat.client import DiscordClient
+
+def main():
     config = Config()
     client = DiscordClient(config)
-    
+
+if __name__ == "__main__":
+    main()

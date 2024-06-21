@@ -1,36 +1,26 @@
 import asyncio
-import io
 import discord
 import requests
-from PIL import Image
-from typing import Union
+from typing import Union, Any
 from discord import app_commands
 from discord.interactions import Interaction
 import openai
 from aiohttp import ClientSession
-import ui_extensions
+import llmchat.ui_extensions
 
-from blip import BLIP
-from config import Config
-from logger import logger, console_handler, color_formatter
-from voice_support import BufferAudioSink
-from persistence import PersistentData
+from llmchat.config import Config
+from llmchat.logger import logger, console_handler, color_formatter
+from llmchat.persistence import PersistentData
 
-from llm_sources import LLMSource
-from tts_sources import TTSSource
-from sr_sources import SRSource
-
+from llmchat.llm_sources import LLMSource
 
 class DiscordClient(discord.Client):
     config: Config
     llm: LLMSource = None
-    tts: TTSSource = None
-    sr: SRSource = None
     db: PersistentData
-    blip: BLIP
-    sink: BufferAudioSink = None
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         self.config = config
 
         if not self.config.can_interact_with_channel_id(-1) and not self.config.discord_active_channels:
@@ -83,7 +73,7 @@ class DiscordClient(discord.Client):
         )
         self.tree.add_command(
             app_commands.Command(
-                name="model", description="Allows you to change the LLM and voice model.", callback=self.set_model
+                name="model", description="Allows you to change the LLM model.", callback=self.set_model
             )
         )
         self.tree.add_command(
@@ -109,21 +99,11 @@ class DiscordClient(discord.Client):
         )
         self.tree.add_command(
             app_commands.Command(
-                name="audiobook_mode",
-                description="Toggles audiobook mode. (Description in README)",
-                callback=self.set_audiobook_mode,
-            )
-        )
-        self.tree.add_command(
-            app_commands.Command(
                 name="reload_config",
                 description="Reloads the settings from config.ini.",
                 callback=self.reload_config,
             )
         )
-
-        if self.config.bot_blip_enabled:
-            self.blip = BLIP()
 
         self.run(
             self.config.discord_bot_api_key,
@@ -131,36 +111,14 @@ class DiscordClient(discord.Client):
             log_formatter=color_formatter,
         )
 
-    async def setup_tts(self):
-        logger.info(f"TTS: {self.config.bot_tts_service}")
-        params = [self, self.config, self.db]
-
-        if self.config.bot_tts_service == "elevenlabs":
-            from tts_sources.elevenlabs import ElevenLabs
-            self.tts = ElevenLabs(*params)
-        elif self.config.bot_tts_service == "azure":
-            from tts_sources.azure import Azure
-            self.tts = Azure(*params)
-        elif self.config.bot_tts_service == "silero":
-            from tts_sources.silero import SileroTTS
-            self.tts = SileroTTS(*params)
-        elif self.config.bot_tts_service == "bark":
-            from tts_sources.bark import Bark
-            self.tts = Bark(*params)
-        elif self.config.bot_tts_service == "play.ht":
-            from tts_sources.playht import PlayHt
-            self.tts = PlayHt(*params)
-        else:
-            logger.critical(f"Unknown TTS service: {self.config.bot_tts_service}")
-
     async def setup_llm(self):
         logger.info(f"LLM: {self.config.bot_llm}")
         params = [self, self.config, self.db]
         if self.config.bot_llm == "openai":
-            from llm_sources.oai import OpenAI
+            from llmchat.llm_sources.oai import OpenAI
             self.llm = OpenAI(*params)
         elif self.config.bot_llm == "llama":
-            from llm_sources.llama import LLaMA
+            from llmchat.llm_sources.llama import LLaMA
             self.llm = LLaMA(*params)
         else:
             logger.critical(f"Unknown LLM: {self.config.bot_llm}")
@@ -168,42 +126,15 @@ class DiscordClient(discord.Client):
         await self.change_presence(activity=discord.Game(name=self.llm.current_model_name))
         logger.info(f"Current model: {self.llm.current_model_name}")
 
-    async def setup_sr(self):
-        logger.info(f"Speech recognition service: {self.config.bot_speech_recognition_service}")
-        params = [self, self.config, self.db]
-        if self.config.bot_speech_recognition_service == "whisper":
-            from sr_sources.whisper import Whisper
-            self.sr = Whisper(*params)
-        elif self.config.bot_speech_recognition_service == "google":
-            from sr_sources.google import Google
-            self.sr = Google(*params)
-        elif self.config.bot_speech_recognition_service == "azure":
-            from sr_sources.azure import Azure
-            self.sr = Azure(*params)
-        else:
-            logger.critical(f"Unknown speech recognition service: {self.config.bot_speech_recognition_service}")
-
     async def reload_config(self, ctx: Interaction):
         await ctx.response.defer()
 
         try:
-            prev_llm, prev_blip, prev_tts, prev_speech = self.config.bot_llm, self.config.bot_blip_enabled, self.config.bot_tts_service, self.config.bot_speech_recognition_service
+            prev_llm, = self.config.bot_llm
             self.config.load()
             # manually load new settings if necessary
             if prev_llm != self.config.bot_llm:
                 await self.setup_llm()
-            if prev_blip != self.config.bot_blip_enabled:
-                if not self.config.bot_blip_enabled:
-                    del self.blip
-                    self.blip = None
-                else:
-                    self.blip = BLIP()
-            if prev_tts != self.config.bot_tts_service:
-                await self.setup_tts()
-            if prev_speech != self.config.bot_speech_recognition_service:
-                del self.sr
-                self.sr = None
-                await self.setup_sr()
 
             self.llm.on_config_reloaded()
 
@@ -225,8 +156,6 @@ class DiscordClient(discord.Client):
             sent_message = await self.send_message(response, ctx.followup)
             await self.store_embedding((ctx.user.id, response, sent_message[0].id))
             self.db.append(sent_message[0], override_content=response)
-            if self.config.bot_audiobook_mode and ctx.guild.voice_client:
-                await self.say(response, ctx.guild.voice_client, ctx.channel)
             return
 
         author_id, content, message_id = history_item
@@ -238,8 +167,6 @@ class DiscordClient(discord.Client):
             sent_message = await self.send_message(response, ctx.followup)
             await self.store_embedding((ctx.user.id, response, sent_message[0].id))
             self.db.append(sent_message[0], override_content=response)
-            if self.config.bot_audiobook_mode and ctx.guild.voice_client:
-                await self.say(response, ctx.guild.voice_client, ctx.channel)
         else:
             delete_me = await ctx.followup.send(content="Retrying...", silent=True)
             await delete_me.delete()
@@ -256,27 +183,11 @@ class DiscordClient(discord.Client):
 
             await self.store_embedding((ctx.user.id, response, last_message.id))
             self.db.append(last_message, override_content=response)
-            if self.config.bot_audiobook_mode and ctx.guild.voice_client:
-                await self.say(response, ctx.guild.voice_client, ctx.channel)
 
     async def set_message_context_count(self, ctx: Interaction, count: int):
         self.config.llm_context_messages_count = count
         await ctx.response.send_message(
             f"Set message context count to {count}", delete_after=3
-        )
-
-    async def set_audiobook_mode(self, ctx: Interaction, status: bool):
-        self.config.bot_audiobook_mode = status
-        vc: discord.VoiceClient = ctx.guild.voice_client
-        if vc and vc.is_connected():
-            if self.config.bot_audiobook_mode:
-                vc.stop_listening()
-            else:
-                self.sink = BufferAudioSink(self.sr, self.on_speech, self.loop)
-                vc.listen(self.sink)
-
-        await ctx.response.send_message(
-            f"Audiobook mode is now **{'on' if status else 'off'}**.", delete_after=3
         )
 
     async def set_avatar(self, ctx: Interaction, url: str):
@@ -320,10 +231,6 @@ class DiscordClient(discord.Client):
         llm_str += f"⚙️ Max tokens: {'Unlimited' if self.config.llm_max_tokens == 0 else self.config.llm_max_tokens}\n"
 
         embed.add_field(name="📝 LLM", value=llm_str, inline=False)
-        embed.add_field(name="🗣️ TTS", value=f"**{self.config.bot_tts_service}**: {self.tts.current_voice_name}",
-                        inline=False)
-        embed.add_field(name="🗨️ SR", value=f"**{self.config.bot_speech_recognition_service}**", inline=False)
-
         embed.add_field(name="\u200B", value="", inline=False)  # seperator
 
         embed.add_field(name="📛 Name", value=self.config.bot_name, inline=False)
@@ -365,26 +272,16 @@ class DiscordClient(discord.Client):
                 logger.error(f"Exception thrown while LLM model: {str(e)}")
                 await ctx.response.edit_message(content=f"Exception thrown while setting LLM model:\n```{str(e)}```", embed=None, view=None, delete_after=5)
 
-        async def voice_callback(ctx: Interaction):
-            try:
-                model = ctx.data["values"][0]
-                self.tts.set_voice(model)
-                await ctx.response.edit_message(content=f"Voice changed to *{self.tts.current_voice_name}*", embed=None, view=None, delete_after=3)
-            except Exception as e:
-                logger.error(f"Exception thrown while setting voice: {str(e)}")
-                await ctx.response.edit_message(content=f"Exception thrown while setting voice:\n```{str(e)}```", embed=None, view=None, delete_after=5)
-
         try:
             def on_exception(e):
                 raise e
 
             view = discord.ui.View()
-            view.add_item(ui_extensions.PaginationDropdown(options=await self.llm.list_models(), callback=llm_callback, on_exception=on_exception))
-            view.add_item(ui_extensions.PaginationDropdown(options=self.tts.list_voices(), callback=voice_callback, on_exception=on_exception))
-            await ctx.followup.send(content="Select an LLM model or a TTS voice:", view=view)
+            view.add_item(llmchat.ui_extensions.PaginationDropdown(options=await self.llm.list_models(), callback=llm_callback, on_exception=on_exception))
+            await ctx.followup.send(content="Select an LLM model:", view=view)
         except Exception as e:
-            logger.error(f"Exception thrown while constructing model/voice pickers: {str(e)}")
-            exc_message = await ctx.followup.send(content=f"Exception thrown while constructing model/voice pickers:\n```{str(e)}```")
+            logger.error(f"Exception thrown while constructing model pickers: {str(e)}")
+            exc_message = await ctx.followup.send(content=f"Exception thrown while constructing model pickers:\n```{str(e)}```")
             await exc_message.delete(delay=5)
 
 
@@ -497,19 +394,12 @@ class DiscordClient(discord.Client):
         logger.info(f"Logged in as {self.user}")
         await self.wait_until_ready()
 
-        # disconnect from all vcs
-        for c in self.voice_clients:
-            await c.disconnect(force=True)
-
         await self.change_presence(activity=discord.Game(name="Loading..."))
 
         self.db: PersistentData = PersistentData(self)
         await self.setup_llm()
-        await self.setup_tts()
-        await self.setup_sr()
 
         await self.tree.sync()
-        self.event(self.on_voice_state_update)
         logger.info("Initialization complete.")
 
     async def store_embedding(self, message: tuple[int, str, int]):
@@ -520,45 +410,6 @@ class DiscordClient(discord.Client):
                 embedding = await openai.Embedding.acreate(api_base=self.config.openai_reverse_proxy_url, input=content, model="text-embedding-ada-002")
                 self.db.add_embedding(message, embedding['data'][0]['embedding'])
                 logger.debug("Added embedding for message " + str(message_id))
-
-    async def on_speech(self, speaker_id, speech):
-        speaker = discord.utils.get(self.get_all_members(), id=speaker_id)
-        await self.store_embedding((speaker_id, speech, -1))
-
-        vc: discord.VoiceClient = speaker.guild.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        self.db.speech(speaker, speech)
-        response = await self.llm.generate_response(speaker)
-        await self.store_embedding((self.user.id, response, -1))
-        self.db.speech(self.user, response)
-
-        vc.stop()
-
-        def _after_speaking(_):
-            self.sink.is_speaking = False
-            logger.debug("Stopped speaking.")
-
-        await self.say(response, vc, after=_after_speaking)
-
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState,
-                                    after: discord.VoiceState):
-        if not before or not after:
-            return
-
-        if not after.channel:
-            # member left channel, check to see if there are any more members there
-            if len(before.channel.members) == 1 and member.guild.voice_client:
-                await member.guild.voice_client.disconnect(force=True)
-        elif before.channel is None and after.channel is not None:
-            # member joined channel, join if you haven't already
-            if member.guild.voice_client is None:
-                vc: discord.VoiceClient = await after.channel.connect()
-                if self.config.bot_audiobook_mode:
-                    return
-                self.sink = BufferAudioSink(self.sr, self.on_speech, self.loop)
-                vc.listen(self.sink)
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         self.db.remove(payload.message_id)
@@ -584,46 +435,12 @@ class DiscordClient(discord.Client):
             self.db.remove_embedding(payload.cached_message.id)  # remove existing
             await self.store_embedding((payload.cached_message.author.id, payload.data["content"], payload.cached_message.id))  # regenerate
 
-    async def say(self, text: str, vc: discord.VoiceClient, text_channel_ctx: discord.TextChannel = None, after=None):
-        try:
-            buf: io.BytesIO = await self.tts.generate_speech(text)
-            vc.stop()
-            # for now i have to write this to a file so ffmpeg won't strip the last part.
-            with open("temp.wav", "wb") as f:
-                f.write(buf.getbuffer())
-
-            def _after(e):
-                if after:
-                    after(e)
-                if e:
-                    raise e
-
-            vc.play(discord.FFmpegOpusAudio("temp.wav"), after=_after)
-        except BaseException as e:
-            logger.error(f"Exception thrown while trying to generate TTS: {str(e)}")
-            if text_channel_ctx:
-                await text_channel_ctx.send(content=f"Exception thrown while trying to generate TTS:\n```{str(e)}```",
-                                            silent=True)
-
     async def on_message(self, message: discord.Message):
         if message.author.id == self.user.id \
                 or not self.config.can_interact_with_channel_id(message.channel.id) \
                 or not message.content:
             # from me or not allowed in channel
             return
-
-        if self.config.bot_blip_enabled:
-            for a in message.attachments:
-                if not a.content_type.startswith("image/"):
-                    continue
-
-                # download image
-                r = requests.get(a.url, stream=True)
-                r.raise_for_status()
-                img = Image.open(r.raw).convert("RGB")
-                caption = self.blip.process_image(img)
-                logger.info(f"Image caption: {caption}")
-                message.content += f"\n[{caption}]"
 
         self.db.append(message)
         await self.store_embedding((message.author.id, message.content, message.id))
@@ -653,9 +470,6 @@ class DiscordClient(discord.Client):
 
         sent_message = await self.send_message(response, message.channel)
         sent_message = sent_message[0]
-
-        if self.config.bot_audiobook_mode and message.guild.voice_client:
-            await self.say(response, message.guild.voice_client, message.channel)
 
         assert sent_message
         self.db.append(sent_message, override_content=response)

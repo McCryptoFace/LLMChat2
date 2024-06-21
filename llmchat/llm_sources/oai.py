@@ -1,7 +1,7 @@
 from . import LLMSource
-from llmchat.config import Config
-from llmchat.persistence import PersistentData
-from llmchat.logger import logger
+from config import Config
+from persistence import PersistentData
+from logger import logger
 import discord
 import openai
 from aiohttp import ClientSession
